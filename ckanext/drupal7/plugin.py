@@ -1,6 +1,7 @@
 import logging
 import uuid
 import hashlib
+import re
 
 import sqlalchemy as sa
 
@@ -9,7 +10,21 @@ import ckan.lib.base as base
 import ckan.logic as logic
 import ckan.lib.helpers as h
 
-log = logging.getLogger('ckanext.saml2')
+log = logging.getLogger('ckanext.drupal7')
+
+
+def sanitize_drupal_username(name):
+    """Convert a drupal username (which can have spaces and other special characters) into a form that is valid in CKAN
+    """
+    # convert spaces and separators
+    name = re.sub('[ .:/]', '-', name)
+    # take out not-allowed characters
+    name = re.sub('[^a-zA-Z0-9-_]', '', name).lower()
+    # remove doubles
+    name = re.sub('--', '-', name)
+    # remove leading or trailing hyphens
+    name = name.strip('-')[:99]
+    return name
 
 
 def _no_permissions(context, msg):
@@ -58,6 +73,7 @@ class Drupal7Plugin(p.SingletonPlugin):
     def get_domain(self):
         return self.domain
 
+    @staticmethod
     def update_config(self, config):
         p.toolkit.add_template_directory(config, 'templates')
 
@@ -69,16 +85,18 @@ class Drupal7Plugin(p.SingletonPlugin):
         if not (self.domain and self.sysadmin_role and self.connection):
             raise Exception('Drupal7 extension has not been configured')
 
-    def before_map(self, map):
+    @staticmethod
+    def before_map(map):
         map.connect(
             'drupal7_unauthorized',
             '/drupal7_unauthorized',
-            controller='ckanext.drupal7.plugin:Drupal7Controller',
+            controller='ckanext.vicdata.drupal_plugin:Drupal7Controller',
             action='unauthorized'
         )
         return map
 
-    def make_password(self):
+    @staticmethod
+    def make_password():
         # create a hard to guess password
         out = ''
         for n in xrange(8):
@@ -90,12 +108,15 @@ class Drupal7Plugin(p.SingletonPlugin):
         session_name = 'SESS%s' % hashlib.sha256(server_name).hexdigest()[:32]
         self.drupal_session_name = session_name
 
-    def identify(self):
-        ''' This does work around saml2 authorization.
-        c.user contains the saml2 id of the logged in user we need to
-        convert this to represent the ckan user. '''
+    def is_sysadmin(self, user_data):
+        return user_data.role_name == self.sysadmin_role
 
-        # If no drupal sesssion name create one
+    def identify(self):
+        """ This does drupal authorization.
+        The drupal session contains the drupal id of the logged in user.
+        We need to convert this to represent the ckan user. """
+
+        # If no drupal session name create one
         if self.drupal_session_name is None:
             self.create_drupal_session_name()
         # Can we find the user?
@@ -105,49 +126,61 @@ class Drupal7Plugin(p.SingletonPlugin):
         if drupal_sid:
             engine = sa.create_engine(self.connection)
             rows = engine.execute(
-                'SELECT u.name, u.mail, t.uid FROM users u '
+                'SELECT u.name, u.mail, t.uid, role_name FROM users u '
                 'JOIN sessions s on s.uid=u.uid LEFT OUTER JOIN '
-                '(SELECT ur.uid FROM role r JOIN users_roles ur '
+                '(SELECT r.name as role_name, ur.uid FROM role r JOIN users_roles ur '
                 '     ON r.rid = ur.rid WHERE r.name=%s '
                 ') AS t ON t.uid = u.uid '
                 'WHERE s.sid=%s',
                 [self.sysadmin_role, str(drupal_sid)])
 
             for row in rows:
-                self.user(row)
-                break
+                # check if session has username, otherwise is unauthenticated user session
+                if row.name and row.name != '':
+                    self.user(row)
+                    break
 
     def user(self, user_data):
         try:
-            user = p.toolkit.get_action('user_show')({'return_minimal': True, 'keep_sensitive_data': True}, {'id': user_data.name})
+            user = p.toolkit.get_action('user_show')(
+                {'return_minimal': True,
+                 'keep_sensitive_data': True,
+                 'keep_email': True},
+                {'id': sanitize_drupal_username(user_data.name)}
+            )
         except p.toolkit.ObjectNotFound:
             pass
             user = None
         if user:
-            # update the user in ckan if not matching drupal data
-            if (user_data.mail != user['email']
-                    or bool(user_data.uid) != user['sysadmin']):
+            # update the user in ckan only if ckan data is not matching drupal data
+            update = False
+            if user_data.mail != user['email']:
+                update = True
+            if self.is_sysadmin(user_data) != user['sysadmin']:
+                update = True
+            if update:
                 user['email'] = user_data.mail
-                user['sysadmin'] = bool(user_data.uid)
-                user['id'] = user_data.name
+                user['sysadmin'] = self.is_sysadmin(user_data)
+                user['id'] = sanitize_drupal_username(user_data.name)
                 user = p.toolkit.get_action('user_update')({'ignore_auth': True}, user)
         else:
             user = {'email': user_data.mail,
-                    'name': user_data.name,
+                    'name': sanitize_drupal_username(user_data.name),
                     'password': self.make_password(),
-                    'sysadmin': bool(user_data.uid),}
+                    'sysadmin': self.is_sysadmin(user_data)}
             user = p.toolkit.get_action('user_create')({'ignore_auth': True}, user)
-            p.toolkit.c.user = user['name']
+        p.toolkit.c.user = user['name']
 
-    def abort(self, status_code, detail, headers, comment):
+    @staticmethod
+    def abort(status_code, detail, headers, comment):
         # HTTP Status 401 causes a login redirect.  We need to prevent this
         # unless we are actually trying to login.
-        if (status_code == 401
-            and p.toolkit.request.environ['PATH_INFO'] != '/user/login'):
+        if status_code == 401 and p.toolkit.request.environ['PATH_INFO'] != '/user/login':
                 h.redirect_to('drupal7_unauthorized')
-        return (status_code, detail, headers, comment)
+        return status_code, detail, headers, comment
 
-    def get_auth_functions(self):
+    @staticmethod
+    def get_auth_functions():
         # we need to prevent some actions being authorized.
         return {
             'user_create': user_create,
@@ -159,7 +192,8 @@ class Drupal7Plugin(p.SingletonPlugin):
 
 class Drupal7Controller(base.BaseController):
 
-    def unauthorized(self):
+    @staticmethod
+    def unauthorized():
         # This is our you are not authorized page
         c = p.toolkit.c
         c.code = 401
