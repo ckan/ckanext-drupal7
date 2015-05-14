@@ -74,7 +74,7 @@ class Drupal7Plugin(p.SingletonPlugin):
         return self.domain
 
     @staticmethod
-    def update_config(self, config):
+    def update_config(config):
         p.toolkit.add_template_directory(config, 'templates')
 
     def configure(self, config):
